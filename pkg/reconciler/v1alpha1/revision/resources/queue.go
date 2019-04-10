@@ -119,6 +119,15 @@ func makeQueueContainer(rev *v1alpha1.Revision, loggingConfig *logging.Config, o
 			Name:  "CONTAINER_CONCURRENCY",
 			Value: strconv.Itoa(int(rev.Spec.ContainerConcurrency)),
 		}, {
+			Name:  "ALLOW_ASYNC",
+			Value: strconv.FormatBool(*rev.Spec.AllowAsync),
+		}, {
+			Name:  "DATABASE_DRIVER",
+			Value: rev.Spec.Database.Driver,
+		}, {
+			Name:  "DATABASE_CONNECTION_STRING",
+			Value: rev.Spec.Database.ConnectionString,
+		}, {
 			Name:  "REVISION_TIMEOUT_SECONDS",
 			Value: strconv.Itoa(int(ts)),
 		}, {

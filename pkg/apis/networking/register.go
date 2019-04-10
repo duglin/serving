@@ -69,7 +69,7 @@ const (
 // Pseudo-constants
 var (
 	// DefaultTimeout will be set if timeout not specified.
-	DefaultTimeout = 10 * time.Minute
+	DefaultTimeout = 10 * time.Hour
 
 	// DefaultRetryCount will be set if Attempts not specified.
 	DefaultRetryCount = 3

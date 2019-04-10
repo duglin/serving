@@ -50,6 +50,11 @@ func (rs *RevisionSpec) SetDefaults(ctx context.Context) {
 		c.Resources.Requests[corev1.ResourceCPU] = cfg.Defaults.RevisionCPURequest
 	}
 
+	if rs.AllowAsync == nil {
+		defaultToTrue := true
+		rs.AllowAsync = &defaultToTrue
+	}
+
 	vms := c.VolumeMounts
 	for i := range vms {
 		vms[i].ReadOnly = true

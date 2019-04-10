@@ -1,0 +1,2 @@
+baseImageOverrides:
+  github.com/knative/serving/cmd/queue: ubuntu:bionic

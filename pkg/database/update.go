@@ -1,0 +1,37 @@
+package database
+
+import (
+	"database/sql"
+	"fmt"
+	"strings"
+)
+
+// UPDATE <table> SET ... WHERE ...
+func (h *sqlHelper) Update(
+	q Queryable,
+	table string,
+	updates SQLAttributes,
+	wheres string,
+	whereBindings ...interface{},
+) (sql.Result, error) {
+	updateCount := len(updates)
+	if updateCount == 0 {
+		return nil, nil
+	}
+
+	query := fmt.Sprintf("UPDATE %s SET\n", table)
+	updateQueries := make([]string, 0, updateCount)
+	bindings := make([]interface{}, 0, updateCount+len(whereBindings))
+
+	for column, value := range updates {
+		updateQueries = append(updateQueries, fmt.Sprintf("%s = ?", column))
+		bindings = append(bindings, value)
+	}
+	query += strings.Join(updateQueries, ", ") + "\n"
+	if len(wheres) > 0 {
+		query += "WHERE " + wheres
+		bindings = append(bindings, whereBindings...)
+	}
+
+	return q.Exec(h.Rebind(query), bindings...)
+}
