@@ -251,6 +251,7 @@ func reportMetrics(pa *pav1alpha1.PodAutoscaler, want int32, got int) error {
 //    | -1   | >= min | active     | active     |
 func computeActiveCondition(pa *pav1alpha1.PodAutoscaler, want int32, got int) {
 	minReady := activeThreshold(pa)
+	minReady = 0 // DUG
 
 	switch {
 	case want == 0:

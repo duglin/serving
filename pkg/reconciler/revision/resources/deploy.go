@@ -245,7 +245,7 @@ func MakeDeployment(rev *v1alpha1.Revision,
 			OwnerReferences: []metav1.OwnerReference{*kmeta.NewControllerRef(rev)},
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas:                ptr.Int32(1),
+			Replicas:                ptr.Int32(0), // DUG
 			Selector:                makeSelector(rev),
 			ProgressDeadlineSeconds: ptr.Int32(ProgressDeadlineSeconds),
 			Template: corev1.PodTemplateSpec{
