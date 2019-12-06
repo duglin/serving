@@ -17,6 +17,7 @@ limitations under the License.
 package resources
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 
@@ -52,6 +53,21 @@ var (
 		Name:        varLogVolume.Name,
 		MountPath:   "/var/log",
 		SubPathExpr: "$(K_INTERNAL_POD_NAMESPACE)_$(K_INTERNAL_POD_NAME)_",
+	}
+
+	taskmgrVolume = corev1.Volume{
+		Name: "taskmgr",
+		VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: "taskmgrpvc",
+				ReadOnly:  true,
+			},
+		},
+	}
+
+	taskmgrVolumeMount = corev1.VolumeMount{
+		Name:      "taskmgr",
+		MountPath: "/vol",
 	}
 
 	// This PreStop hook is actually calling an endpoint on the queue-proxy
@@ -131,6 +147,12 @@ func makeContainer(container corev1.Container, rev *v1.Revision) corev1.Containe
 	varLogMount := varLogVolumeMount.DeepCopy()
 	varLogMount.SubPathExpr += container.Name
 
+	if tmp, _ := makeLabels(rev)["type"]; tmp != "" { // == "task" {
+		container.VolumeMounts = append(container.VolumeMounts, taskmgrVolumeMount)
+		typeEnv := corev1.EnvVar{Name: "K_TYPE", Value: tmp}
+		container.Env = append(container.Env, typeEnv)
+	}
+
 	container.VolumeMounts = append(container.VolumeMounts, *varLogMount)
 	container.Lifecycle = userLifecycle
 	container.Env = append(container.Env, getKnativeEnvVar(rev)...)
@@ -169,6 +191,59 @@ func BuildPodSpec(rev *v1.Revision, containers []corev1.Container) *corev1.PodSp
 	pod.Containers = containers
 	pod.Volumes = append([]corev1.Volume{varLogVolume}, rev.Spec.Volumes...)
 	pod.TerminationGracePeriodSeconds = rev.Spec.TimeoutSeconds
+
+	// If "flavor" was specified then use that as the nodeSelector
+	if tmp, _ := makeLabels(rev)["flavor"]; tmp != "" {
+		pod.NodeSelector = map[string]string{"flavor": tmp}
+		pod.Tolerations = append(pod.Tolerations, corev1.Toleration{
+			Key:    "flavor",
+			Value:  tmp,
+			Effect: "NoSchedule",
+		})
+	}
+
+	if tmp, _ := makeLabels(rev)["type"]; tmp != "" {
+		pod.Volumes = append(pod.Volumes, taskmgrVolume)
+
+		userCMD := pod.Containers[0].Command
+		userARG := pod.Containers[0].Args
+		imgCMD := []string{}
+		imgARG := []string{}
+
+		if rev.Status.Annotations != nil {
+			if eps := rev.Status.Annotations["eps"]; eps != "" {
+				json.Unmarshal([]byte(eps), &imgCMD)
+			}
+			if cmd := rev.Status.Annotations["cmd"]; cmd != "" {
+				json.Unmarshal([]byte(cmd), &imgARG)
+			}
+		}
+
+		realCMD := []string{"/vol/taskmgr"}
+		if tmp == "pull" {
+			realCMD = []string{"/vol/pullmgr"}
+		}
+
+		// If user didnt' specific a CMD then use the one from the image
+		if len(userCMD) == 0 {
+			realCMD = append(realCMD, imgCMD...)
+
+			// Any args specified by the user overrides what's in the image
+			if len(userARG) == 0 {
+				realCMD = append(realCMD, imgARG...)
+			} else {
+				realCMD = append(realCMD, userARG...)
+			}
+		} else {
+			// User specified CMD wins, and we ignore image specified ARGs
+			realCMD = append(realCMD, userCMD...)
+			realCMD = append(realCMD, userARG...)
+		}
+
+		pod.Containers[0].Command = realCMD
+		pod.Containers[0].Args = nil
+	}
+
 	return pod
 }
 

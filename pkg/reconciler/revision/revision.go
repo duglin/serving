@@ -18,6 +18,7 @@ package revision
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -46,7 +47,7 @@ import (
 const digestResolutionTimeout = 60 * time.Second
 
 type resolver interface {
-	Resolve(context.Context, string, k8schain.Options, sets.String) (string, error)
+	Resolve(context.Context, string, bool, k8schain.Options, sets.String) (string, []string, []string, error)
 }
 
 // Reconciler implements controller.Reconciler for Revision resources.
@@ -82,6 +83,8 @@ func (c *Reconciler) reconcileDigest(ctx context.Context, rev *v1.Revision) erro
 		}
 	}
 
+	isTask := rev.ObjectMeta.Labels["type"] != "" // == "task"
+
 	// The image digest has already been resolved.
 	if len(rev.Status.ContainerStatuses) == len(rev.Spec.Containers) {
 		return nil
@@ -98,6 +101,8 @@ func (c *Reconciler) reconcileDigest(ctx context.Context, rev *v1.Revision) erro
 		ImagePullSecrets:   imagePullSecrets,
 	}
 
+	eps := []string{}
+	cmd := []string{}
 	var digestGrp errgroup.Group
 	containerStatuses := make([]v1.ContainerStatus, len(rev.Spec.Containers))
 	for i, container := range rev.Spec.Containers {
@@ -107,7 +112,7 @@ func (c *Reconciler) reconcileDigest(ctx context.Context, rev *v1.Revision) erro
 			ctx, cancel := context.WithTimeout(ctx, digestResolutionTimeout)
 			defer cancel()
 
-			digest, err := c.resolver.Resolve(ctx, container.Image,
+			digest, daEps, daCmd, err := c.resolver.Resolve(ctx, container.Image, isTask,
 				opt, cfgs.Deployment.RegistriesSkippingTagResolving)
 			if err != nil {
 				return errors.New(v1.RevisionContainerMissingMessage(container.Image, fmt.Sprintf("failed to resolve image to digest: %v", err)))
@@ -115,6 +120,8 @@ func (c *Reconciler) reconcileDigest(ctx context.Context, rev *v1.Revision) erro
 
 			if len(rev.Spec.Containers) == 1 || len(container.Ports) != 0 {
 				rev.Status.DeprecatedImageDigest = digest
+				eps = daEps
+				cmd = daCmd
 			}
 
 			containerStatuses[i] = v1.ContainerStatus{
@@ -129,6 +136,19 @@ func (c *Reconciler) reconcileDigest(ctx context.Context, rev *v1.Revision) erro
 		return err
 	}
 	rev.Status.ContainerStatuses = containerStatuses
+
+	if isTask {
+		epsJson, _ := json.Marshal(eps)
+		cmdJson, _ := json.Marshal(cmd)
+
+		if rev.Status.Annotations == nil {
+			rev.Status.Annotations = map[string]string{}
+		}
+
+		rev.Status.Annotations["eps"] = string(epsJson)
+		rev.Status.Annotations["cmd"] = string(cmdJson)
+	}
+
 	return nil
 }
 

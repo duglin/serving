@@ -25,11 +25,14 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn/k8schain"
 	"github.com/google/go-containerregistry/pkg/name"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/kubernetes"
 )
@@ -87,30 +90,86 @@ func newResolverTransport(path string) (*http.Transport, error) {
 func (r *digestResolver) Resolve(
 	ctx context.Context,
 	image string,
+	getCmd bool,
 	opt k8schain.Options,
-	registriesToSkip sets.String) (string, error) {
+	registriesToSkip sets.String) (string, []string, []string, error) {
+	// eps, cmd
+
+	eps := []string(nil)
+	cmd := []string(nil)
+	digest := ""
+
 	kc, err := k8schain.New(r.client, opt)
 	if err != nil {
-		return "", fmt.Errorf("failed to initialize authentication: %w", err)
+		return "", eps, cmd, fmt.Errorf("failed to initialize authentication: %w", err)
 	}
 
-	if _, err := name.NewDigest(image, name.WeakValidation); err == nil {
-		// Already a digest
-		return image, nil
+	// baseImage is used just to get the registry info (from 'tag' var below)
+	baseImage := image
+	if i := strings.Index(image, "@"); i > 0 {
+		baseImage = image[:i]
 	}
 
-	tag, err := name.NewTag(image, name.WeakValidation)
+	if _, err = name.NewDigest(image, name.WeakValidation); err == nil {
+		// "image" is already a digest so either save it or return it now
+		digest = image
+		if !getCmd {
+			return digest, eps, cmd, nil
+		}
+	}
+
+	tag, err := name.ParseReference(baseImage, name.WeakValidation)
 	if err != nil {
-		return "", fmt.Errorf("failed to parse image name %q into a tag: %w", image, err)
+		return "", eps, cmd, fmt.Errorf("failed to parse image name %q into a tag: %w", baseImage, err)
 	}
 
-	if registriesToSkip.Has(tag.Registry.RegistryStr()) {
-		return "", nil
+	if registriesToSkip.Has(tag.Context().RegistryStr()) {
+		return "", eps, cmd, nil
 	}
 
 	desc, err := remote.Get(tag, remote.WithContext(ctx), remote.WithTransport(r.transport), remote.WithAuthFromKeychain(kc))
 	if err != nil {
-		return "", err
+		return "", eps, cmd, fmt.Errorf("failed to fetch image information: %w", err)
 	}
-	return fmt.Sprintf("%s@%s", tag.Repository.String(), desc.Digest), nil
+
+	var img v1.Image
+	if getCmd {
+		img, err = remote.Image(tag, remote.WithTransport(r.transport), remote.WithAuthFromKeychain(kc))
+		if err != nil {
+			return "", eps, cmd, fmt.Errorf("failed to fetch image: %w", err)
+		}
+		cf, err := img.ConfigFile()
+		if err != nil {
+			return "", eps, cmd, fmt.Errorf("failed to get image configfile1: %w", err)
+		}
+
+		eps = cf.Config.Entrypoint
+		cmd = cf.Config.Cmd
+
+		// fmt.Printf("DUG: EPS: %#v\n", eps)
+		// fmt.Printf("DUG: CMD: %#v\n", cmd)
+
+		if digest != "" {
+			return digest, eps, cmd, nil
+		}
+	}
+
+	// TODO(#3997): Use remote.Get to resolve manifest lists to digests as well
+	// once CRI-O is fixed: https://github.com/cri-o/cri-o/issues/2157
+
+	switch desc.MediaType {
+	case types.OCIImageIndex, types.DockerManifestList:
+		img, err := desc.Image()
+		if err != nil {
+			return "", eps, cmd, fmt.Errorf("failed to get image reference: %w", err)
+		}
+		dgst, err := img.Digest()
+		if err != nil {
+			return "", eps, cmd, fmt.Errorf("failed to get image digest: %w", err)
+		}
+		return fmt.Sprintf("%s@%s", tag.Context().String(), dgst), eps, cmd, nil
+	default:
+		return fmt.Sprintf("%s@%s", tag.Context().String(), desc.Digest), eps, cmd, nil
+	}
+	return fmt.Sprintf("%s@%s", tag.Context().String(), desc.Digest), eps, cmd, nil
 }

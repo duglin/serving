@@ -20,6 +20,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -350,6 +351,66 @@ func buildProbe(logger *zap.SugaredLogger, probeJSON string) *readiness.Probe {
 	return readiness.NewProbe(coreProbe)
 }
 
+type BatchRoundTripper struct {
+	roundTrip http.RoundTripper // func(*http.Request) (*http.Response, error)
+}
+
+func (brt BatchRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	jobID := ""
+	jobIndex := ""
+	done := false
+
+	// If it's a batch job, start the updater loop and save the info we need
+	if jobID = r.Header.Get("K_JOB_ID"); jobID != "" {
+		jobIndex = r.Header.Get("K_JOB_INDEX")
+		go func() {
+			for !done {
+				UpdateJob(jobID, jobIndex, "")
+				time.Sleep(5 * time.Second)
+			}
+		}()
+	}
+
+	res, err := brt.roundTrip.RoundTrip(r)
+
+	if jobID != "" {
+		done = true
+		if res.StatusCode < 200 || res.StatusCode > 299 {
+			UpdateJob(jobID, jobIndex, "fail")
+		} else {
+			UpdateJob(jobID, jobIndex, "pass")
+		}
+	}
+
+	return res, err
+}
+
+func UpdateJob(jobID string, jobIndex string, status string) {
+	fmt.Printf("Update job-%s: %q", jobIndex, status)
+	url := "http://jobcontroller.default.svc.cluster.local"
+	if status != "" {
+		status = "&status=" + status
+	}
+	cmd := fmt.Sprintf("%s/update?job=%s&index=%s%s", url,
+		jobID, jobIndex, status)
+	res, err := curl(cmd)
+	if err != nil {
+		fmt.Printf("Curl: %s | %s\n", err, res)
+	}
+}
+
+func curl(url string) (string, error) {
+	res, err := http.Get(url)
+	body := ""
+	if res != nil && res.Body != nil {
+		var buf = []byte{}
+		buf, _ = ioutil.ReadAll(res.Body)
+		body = string(buf)
+		res.Body.Close()
+	}
+	return body, err
+}
+
 func buildServer(env config, healthState *health.State, rp *readiness.Probe, stats *network.RequestStats,
 	logger *zap.SugaredLogger) *http.Server {
 	target := &url.URL{
@@ -368,6 +429,9 @@ func buildServer(env config, healthState *health.State, rp *readiness.Probe, sta
 	httpProxy.BufferPool = network.NewBufferPool()
 	httpProxy.FlushInterval = network.FlushInterval
 	activatorutil.SetupHeaderPruning(httpProxy)
+
+	// Wrapper for batch processing
+	httpProxy.Transport = BatchRoundTripper{roundTrip: httpProxy.Transport}
 
 	breaker := buildBreaker(logger, env)
 	metricsSupported := supportsMetrics(logger, env)
