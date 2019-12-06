@@ -278,6 +278,11 @@ func makeQueueContainer(rev *v1.Revision, cfg *config.Config) (*corev1.Container
 		StartupProbe:    execProbe,
 		ReadinessProbe:  httpProbe,
 		SecurityContext: queueSecurityContext,
+		VolumeMounts: []corev1.VolumeMount{{
+			Name:      "knative-taskmgr",
+			ReadOnly:  false,
+			MountPath: queue.TaskmgrPrefix,
+		}},
 		Env: []corev1.EnvVar{{
 			Name:  "SERVING_NAMESPACE",
 			Value: rev.Namespace,

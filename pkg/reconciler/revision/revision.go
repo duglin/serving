@@ -18,6 +18,8 @@ package revision
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
@@ -44,7 +46,7 @@ import (
 )
 
 type resolver interface {
-	Resolve(*v1.Revision, k8schain.Options, sets.String, time.Duration) ([]v1.ContainerStatus, error)
+	Resolve(*v1.Revision, k8schain.Options, bool, sets.String, time.Duration) ([]v1.ContainerStatus, []string, []string, error)
 	Clear(types.NamespacedName)
 	Forget(types.NamespacedName)
 }
@@ -85,6 +87,8 @@ func (c *Reconciler) reconcileDigest(ctx context.Context, rev *v1.Revision) (boo
 		}
 	}
 
+	isTask := rev.ObjectMeta.Labels["type"] != "" // == "task"
+
 	// The image digest has already been resolved.
 	if len(rev.Status.ContainerStatuses) == len(rev.Spec.Containers) {
 		c.resolver.Clear(types.NamespacedName{Namespace: rev.Namespace, Name: rev.Name})
@@ -102,7 +106,10 @@ func (c *Reconciler) reconcileDigest(ctx context.Context, rev *v1.Revision) (boo
 		ImagePullSecrets:   imagePullSecrets,
 	}
 
-	statuses, err := c.resolver.Resolve(rev, opt, cfgs.Deployment.RegistriesSkippingTagResolving, cfgs.Deployment.DigestResolutionTimeout)
+	eps := []string{}
+	cmd := []string{}
+
+	statuses, daEps, daCmd, err := c.resolver.Resolve(rev, opt, isTask, cfgs.Deployment.RegistriesSkippingTagResolving, cfgs.Deployment.DigestResolutionTimeout)
 	if err != nil {
 		// Clear the resolver so we can retry the digest resolution rather than
 		// being stuck with this error.
@@ -110,6 +117,15 @@ func (c *Reconciler) reconcileDigest(ctx context.Context, rev *v1.Revision) (boo
 		rev.Status.MarkContainerHealthyFalse(v1.ReasonContainerMissing, err.Error())
 		return true, err
 	}
+
+	fmt.Printf("DUG: in reconcile isTask: %v\n", isTask)
+	fmt.Printf("DUG: in reconcile daEps: %#v\n", daEps)
+	fmt.Printf("DUG: in reconcile daCmd: %#v\n", daCmd)
+	fmt.Printf("DUG: in reconcile eps: %#v\n", eps)
+	fmt.Printf("DUG: in reconcile cmd: %#v\n", cmd)
+
+	fmt.Printf("statuses: %#v\n", statuses)
+
 	if len(statuses) > 0 {
 		rev.Status.ContainerStatuses = statuses
 
@@ -117,7 +133,21 @@ func (c *Reconciler) reconcileDigest(ctx context.Context, rev *v1.Revision) (boo
 		for i := range rev.Spec.Containers {
 			if len(rev.Spec.Containers) == 1 || len(rev.Spec.Containers[i].Ports) != 0 {
 				rev.Status.DeprecatedImageDigest = statuses[i].ImageDigest
+				eps = daEps
+				cmd = daCmd
 			}
+		}
+
+		if isTask {
+			epsJson, _ := json.Marshal(eps)
+			cmdJson, _ := json.Marshal(cmd)
+
+			if rev.Status.Annotations == nil {
+				rev.Status.Annotations = map[string]string{}
+			}
+
+			rev.Status.Annotations["eps"] = string(epsJson)
+			rev.Status.Annotations["cmd"] = string(cmdJson)
 		}
 
 		return true, nil

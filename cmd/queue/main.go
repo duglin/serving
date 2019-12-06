@@ -21,9 +21,12 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -110,6 +113,11 @@ func init() {
 }
 
 func main() {
+	if queue.IsTaskmgr() {
+		queue.Taskmgr(signals.NewContext())
+		return
+	}
+
 	flag.Parse()
 
 	// If this is set, we run as a standalone binary to probe the queue-proxy.
@@ -122,6 +130,12 @@ func main() {
 		}
 
 		os.Exit(standaloneProbeMain(*startupProbeTimeout, transport))
+	}
+
+	// Copy the queue binary to the shared volume.
+	if err := cp(os.Args[0], filepath.Join(queue.TaskmgrPrefix, "taskmgr")); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
 
 	// Otherwise, we run as the queue-proxy service.
@@ -271,6 +285,66 @@ func buildProbe(logger *zap.SugaredLogger, env config) *readiness.Probe {
 	return readiness.NewProbe(coreProbe)
 }
 
+type BatchRoundTripper struct {
+	roundTrip http.RoundTripper // func(*http.Request) (*http.Response, error)
+}
+
+func (brt BatchRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	jobID := ""
+	jobIndex := ""
+	done := false
+
+	// If it's a batch job, start the updater loop and save the info we need
+	if jobID = r.Header.Get("K_JOB_ID"); jobID != "" {
+		jobIndex = r.Header.Get("K_JOB_INDEX")
+		go func() {
+			for !done {
+				UpdateJob(jobID, jobIndex, "")
+				time.Sleep(5 * time.Second)
+			}
+		}()
+	}
+
+	res, err := brt.roundTrip.RoundTrip(r)
+
+	if jobID != "" {
+		done = true
+		if res.StatusCode < 200 || res.StatusCode > 299 {
+			UpdateJob(jobID, jobIndex, "fail")
+		} else {
+			UpdateJob(jobID, jobIndex, "pass")
+		}
+	}
+
+	return res, err
+}
+
+func UpdateJob(jobID string, jobIndex string, status string) {
+	fmt.Printf("Update job-%s: %q", jobIndex, status)
+	url := "http://jobcontroller.default.svc.cluster.local"
+	if status != "" {
+		status = "&status=" + status
+	}
+	cmd := fmt.Sprintf("%s/update?job=%s&index=%s%s", url,
+		jobID, jobIndex, status)
+	res, err := curl(cmd)
+	if err != nil {
+		fmt.Printf("Curl: %s | %s\n", err, res)
+	}
+}
+
+func curl(url string) (string, error) {
+	res, err := http.Get(url)
+	body := ""
+	if res != nil && res.Body != nil {
+		var buf = []byte{}
+		buf, _ = ioutil.ReadAll(res.Body)
+		body = string(buf)
+		res.Body.Close()
+	}
+	return body, err
+}
+
 func buildServer(ctx context.Context, env config, healthState *health.State, rp *readiness.Probe, stats *network.RequestStats,
 	logger *zap.SugaredLogger) *http.Server {
 
@@ -286,6 +360,9 @@ func buildServer(ctx context.Context, env config, healthState *health.State, rp 
 	httpProxy.ErrorHandler = pkgnet.ErrorHandler(logger)
 	httpProxy.BufferPool = network.NewBufferPool()
 	httpProxy.FlushInterval = network.FlushInterval
+
+	// Wrapper for batch processing
+	httpProxy.Transport = BatchRoundTripper{roundTrip: httpProxy.Transport}
 
 	breaker := buildBreaker(logger, env)
 	metricsSupported := supportsMetrics(ctx, logger, env)
@@ -461,4 +538,23 @@ func flush(logger *zap.SugaredLogger) {
 	os.Stdout.Sync()
 	os.Stderr.Sync()
 	metrics.FlushExporter()
+}
+
+func cp(src, dst string) error {
+	s, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	// Owner has permission to write and execute, and anybody has
+	// permission to execute.
+	d, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE, 0755)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+
+	_, err = io.Copy(d, s)
+	return err
 }

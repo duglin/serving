@@ -24,9 +24,11 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"strings"
 
 	"github.com/google/go-containerregistry/pkg/authn/k8schain"
 	"github.com/google/go-containerregistry/pkg/name"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/kubernetes"
@@ -75,30 +77,71 @@ func newResolverTransport(path string, maxIdleConns, maxIdleConnsPerHost int) (*
 func (r *digestResolver) Resolve(
 	ctx context.Context,
 	image string,
+	getCmd bool,
 	opt k8schain.Options,
-	registriesToSkip sets.String) (string, error) {
+	registriesToSkip sets.String) (string, []string, []string, error) {
+	// eps, cmd
+
+	eps := []string(nil)
+	cmd := []string(nil)
+	digest := ""
 	kc, err := k8schain.New(ctx, r.client, opt)
 	if err != nil {
-		return "", fmt.Errorf("failed to initialize authentication: %w", err)
+		return "", eps, cmd, fmt.Errorf("failed to initialize authentication: %w", err)
 	}
 
-	if _, err := name.NewDigest(image, name.WeakValidation); err == nil {
-		// Already a digest
-		return image, nil
+	// baseImage is used just to get the registry info (from 'tag' var below)
+	baseImage := image
+	if i := strings.Index(image, "@"); i > 0 {
+		baseImage = image[:i]
 	}
 
-	tag, err := name.NewTag(image, name.WeakValidation)
+	if _, err = name.NewDigest(image, name.WeakValidation); err == nil {
+		// "image" is already a digest so either save it or return it now
+		digest = image
+		if !getCmd {
+			return digest, eps, cmd, nil
+		}
+	}
+
+	tag, err := name.ParseReference(baseImage, name.WeakValidation)
 	if err != nil {
-		return "", fmt.Errorf("failed to parse image name %q into a tag: %w", image, err)
+		return "", eps, cmd, fmt.Errorf("failed to parse image name %q into a tag: %w", baseImage, err)
 	}
 
-	if registriesToSkip.Has(tag.Registry.RegistryStr()) {
-		return "", nil
+	if registriesToSkip.Has(tag.Context().RegistryStr()) {
+		return "", eps, cmd, nil
 	}
 
 	desc, err := remote.Head(tag, remote.WithContext(ctx), remote.WithTransport(r.transport), remote.WithAuthFromKeychain(kc), remote.WithUserAgent(r.userAgent))
 	if err != nil {
-		return "", err
+		return "", eps, cmd, fmt.Errorf("failed to fetch image information: %w", err)
 	}
-	return fmt.Sprintf("%s@%s", tag.Repository.String(), desc.Digest), nil
+
+	var img v1.Image
+	fmt.Printf("DUG: getCmd: %v\n", getCmd)
+	if getCmd {
+		img, err = remote.Image(tag, remote.WithTransport(r.transport), remote.WithAuthFromKeychain(kc))
+		if err != nil {
+			return "", eps, cmd, fmt.Errorf("failed to fetch image: %w", err)
+		}
+		cf, err := img.ConfigFile()
+		if err != nil {
+			return "", eps, cmd, fmt.Errorf("failed to get image configfile1: %w", err)
+		}
+
+		eps = cf.Config.Entrypoint
+		cmd = cf.Config.Cmd
+
+		fmt.Printf("DUG: EPS: %#v\n", eps)
+		fmt.Printf("DUG: CMD: %#v\n", cmd)
+
+		/*
+			if digest != "" {
+				return digest, eps, cmd, nil
+			}
+		*/
+	}
+
+	return fmt.Sprintf("%s@%s", tag.Context().String(), desc.Digest), eps, cmd, nil
 }

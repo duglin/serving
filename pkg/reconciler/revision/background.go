@@ -32,7 +32,7 @@ import (
 
 // imageResolver is an interface used mostly to mock digestResolver for tests.
 type imageResolver interface {
-	Resolve(ctx context.Context, image string, opt k8schain.Options, registriesToSkip sets.String) (string, error)
+	Resolve(ctx context.Context, image string, getCmd bool, opt k8schain.Options, registriesToSkip sets.String) (string, []string, []string, error)
 }
 
 // backgroundResolver performs background downloads of image digests.
@@ -66,6 +66,8 @@ type resolveResult struct {
 	statuses map[int]v1.ContainerStatus
 	want     int
 	err      error
+	eps      []string
+	cmd      []string
 }
 
 // workItem is a single task submitted to the queue, to resolve a single image
@@ -74,9 +76,10 @@ type workItem struct {
 	revision types.NamespacedName
 	timeout  time.Duration
 
-	name  string
-	image string
-	index int
+	name   string
+	image  string
+	index  int
+	getCmd bool
 }
 
 func newBackgroundResolver(logger *zap.SugaredLogger, resolver imageResolver, queue workqueue.RateLimitingInterface, enqueue func(types.NamespacedName)) *backgroundResolver {
@@ -144,7 +147,7 @@ func (r *backgroundResolver) Start(stop <-chan struct{}, maxInFlight int) (done 
 // If this method returns `nil, nil` this implies a resolve was triggered or is
 // already in progress, so the reconciler should exit and wait for the revision
 // to be re-enqueued when the result is ready.
-func (r *backgroundResolver) Resolve(rev *v1.Revision, opt k8schain.Options, registriesToSkip sets.String, timeout time.Duration) ([]v1.ContainerStatus, error) {
+func (r *backgroundResolver) Resolve(rev *v1.Revision, opt k8schain.Options, getCmd bool, registriesToSkip sets.String, timeout time.Duration) ([]v1.ContainerStatus, []string, []string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -155,17 +158,17 @@ func (r *backgroundResolver) Resolve(rev *v1.Revision, opt k8schain.Options, reg
 
 	result, inFlight := r.results[name]
 	if !inFlight {
-		r.addWorkItems(rev, name, opt, registriesToSkip, timeout)
-		return nil, nil
+		r.addWorkItems(rev, name, getCmd, opt, registriesToSkip, timeout)
+		return nil, nil, nil, nil
 	}
 
 	if !result.ready() {
-		return nil, nil
+		return nil, nil, nil, nil
 	}
 
 	ret := r.results[name]
 	if ret.err != nil {
-		return nil, ret.err
+		return nil, nil, nil, ret.err
 	}
 
 	array := make([]v1.ContainerStatus, len(rev.Spec.Containers))
@@ -173,12 +176,12 @@ func (r *backgroundResolver) Resolve(rev *v1.Revision, opt k8schain.Options, reg
 		array[k] = v
 	}
 
-	return array, ret.err
+	return array, ret.eps, ret.cmd, ret.err
 }
 
 // addWorkItems adds a digest resolve item to the queue for each container in the revision.
 // This is expected to be called with the mutex locked.
-func (r *backgroundResolver) addWorkItems(rev *v1.Revision, name types.NamespacedName, opt k8schain.Options, registriesToSkip sets.String, timeout time.Duration) {
+func (r *backgroundResolver) addWorkItems(rev *v1.Revision, name types.NamespacedName, getCmd bool, opt k8schain.Options, registriesToSkip sets.String, timeout time.Duration) {
 	r.results[name] = &resolveResult{
 		opt:              opt,
 		registriesToSkip: registriesToSkip,
@@ -197,6 +200,7 @@ func (r *backgroundResolver) addWorkItems(rev *v1.Revision, name types.Namespace
 			name:     container.Name,
 			image:    container.Image,
 			index:    i,
+			getCmd:   getCmd,
 		}
 
 		r.results[name].workItems[i] = item
@@ -223,7 +227,7 @@ func (r *backgroundResolver) processWorkItem(item workItem) {
 	ctx, cancel := context.WithTimeout(context.Background(), item.timeout)
 	defer cancel()
 
-	resolvedDigest, resolveErr := r.resolver.Resolve(ctx, item.image, result.opt, result.registriesToSkip)
+	resolvedDigest, eps, cmd, resolveErr := r.resolver.Resolve(ctx, item.image, item.getCmd, result.opt, result.registriesToSkip)
 
 	// lock after the resolve because we don't want to block parallel resolves,
 	// just storing the result.
@@ -253,6 +257,11 @@ func (r *backgroundResolver) processWorkItem(item workItem) {
 		Name:        item.name,
 		ImageDigest: resolvedDigest,
 	}
+	fmt.Printf("DUG: inProcess EPS: %#v\n", eps)
+	fmt.Printf("DUG: inProcess CMD: %#v\n", cmd)
+
+	r.results[item.revision].eps = eps
+	r.results[item.revision].cmd = cmd
 
 	if result.ready() {
 		result.completionCallback()
