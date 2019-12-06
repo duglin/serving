@@ -30,6 +30,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kelseyhightower/envconfig"
@@ -86,6 +87,8 @@ var (
 	logger *zap.SugaredLogger
 
 	readinessProbeTimeout = flag.Int("probe-period", -1, "run readiness probe with given timeout")
+
+	activeAsyncWG = sync.WaitGroup{}
 )
 
 type config struct {
@@ -142,6 +145,13 @@ func proxyHandler(reqChan chan queue.ReqEvent, breaker *queue.Breaker, tracingEn
 			defer proxySpan.End()
 		}
 
+		// Any mention of "async" as a query parameter triggers it.
+		// A non-nil 'asyncChan' means we're doing async
+		var asyncChan chan struct{}
+		if _, ok := r.URL.Query()["async"]; ok {
+			asyncChan = make(chan struct{})
+		}
+
 		// Metrics for autoscaling.
 		in, out := queue.ReqIn, queue.ReqOut
 		if activator.Name == network.KnativeProxyHeader(r) {
@@ -149,14 +159,21 @@ func proxyHandler(reqChan chan queue.ReqEvent, breaker *queue.Breaker, tracingEn
 		}
 		reqChan <- queue.ReqEvent{Time: time.Now(), EventType: in}
 		defer func() {
-			reqChan <- queue.ReqEvent{Time: time.Now(), EventType: out}
+			go func() {
+				// If this is an async request then wait until it's done
+				// before we send the "out" (all done) event
+				if asyncChan != nil {
+					<-asyncChan
+				}
+				reqChan <- queue.ReqEvent{Time: time.Now(), EventType: out}
+			}()
 		}()
 		network.RewriteHostOut(r)
 
 		// Enforce queuing and concurrency limits.
 		if breaker != nil {
 			if err := breaker.Maybe(r.Context(), func() {
-				next.ServeHTTP(w, r)
+				handleRequest(next, w, r, asyncChan)
 			}); err != nil {
 				switch err {
 				case context.DeadlineExceeded, queue.ErrRequestQueueFull:
@@ -166,9 +183,36 @@ func proxyHandler(reqChan chan queue.ReqEvent, breaker *queue.Breaker, tracingEn
 				}
 			}
 		} else {
-			next.ServeHTTP(w, r)
+			handleRequest(next, w, r, asyncChan)
 		}
 	}
+}
+
+func handleRequest(handler http.Handler, w http.ResponseWriter, r *http.Request, asyncChan chan struct{}) {
+	logger.Infof("handle request - asyncReq: %v", asyncChan != nil)
+
+	// Not an async request so just invoke the service and then exit
+	if asyncChan == nil {
+		handler.ServeHTTP(w, r)
+		return
+	}
+
+	go func() {
+		// Register that we have another async request that's active
+		activeAsyncWG.Add(1)
+		defer func() {
+			logger.Infof("Async call exited")
+			close(asyncChan)
+			activeAsyncWG.Done()
+		}()
+
+		// Use a fake http ResponseWriter
+		resp := &queue.ResponseCache{}
+		rr := r.WithContext(context.Background())
+		handler.ServeHTTP(resp, rr)
+	}()
+
+	w.WriteHeader(http.StatusAccepted)
 }
 
 func preferPodForScaledown(downwardAPILabelsPath string) (bool, error) {
@@ -419,6 +463,11 @@ func main() {
 		healthState.Shutdown(func() {
 			// Give Istio time to sync our "not ready" state.
 			time.Sleep(quitSleepDuration)
+
+			// wait for the in-flight async requests to finish
+			logger.Info("Waiting for async requests to finish")
+			activeAsyncWG.Wait()
+			logger.Info("All async requests are done")
 
 			// Calling server.Shutdown() allows pending requests to
 			// complete, while no new work is accepted.
