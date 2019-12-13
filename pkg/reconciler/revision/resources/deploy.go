@@ -72,6 +72,21 @@ var (
 		MountPath: internalVolumePath,
 	}
 
+	taskmgrVolume = corev1.Volume{
+		Name: "taskmgr",
+		VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: "taskmgrpvc",
+				ReadOnly:  true,
+			},
+		},
+	}
+
+	taskmgrVolumeMount = corev1.VolumeMount{
+		Name:      "taskmgr",
+		MountPath: "/vol",
+	}
+
 	// This PreStop hook is actually calling an endpoint on the queue-proxy
 	// because of the way PreStop hooks are called by kubelet. We use this
 	// to block the user-container from exiting before the queue-proxy is ready
@@ -120,6 +135,10 @@ func makePodSpec(rev *v1alpha1.Revision, loggingConfig *logging.Config, tracingC
 	// update the fieldmasks / validations in pkg/apis/serving
 
 	userContainer.VolumeMounts = append(userContainer.VolumeMounts, varLogVolumeMount)
+	if tmp, _ := makeLabels(rev)["type"]; tmp == "task" {
+		userContainer.VolumeMounts = append(userContainer.VolumeMounts, taskmgrVolumeMount)
+	}
+
 	userContainer.Lifecycle = userLifecycle
 	userPort := getUserPort(rev)
 	userPortInt := int(userPort)
@@ -161,6 +180,13 @@ func makePodSpec(rev *v1alpha1.Revision, loggingConfig *logging.Config, tracingC
 		ServiceAccountName:            rev.Spec.ServiceAccountName,
 		TerminationGracePeriodSeconds: rev.Spec.TimeoutSeconds,
 		ImagePullSecrets:              rev.Spec.ImagePullSecrets,
+	}
+
+	if tmp, _ := makeLabels(rev)["type"]; tmp == "task" {
+		podSpec.Volumes = append(podSpec.Volumes, taskmgrVolume)
+
+		podSpec.Containers[0].Command = []string{"/vol/taskmgr"}
+		podSpec.Containers[0].Args = nil
 	}
 
 	// Add the Knative internal volume only if /var/log collection is enabled
