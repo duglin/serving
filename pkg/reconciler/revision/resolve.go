@@ -41,6 +41,12 @@ type digestResolver struct {
 	transport http.RoundTripper
 }
 
+type imageData struct {
+	digest     string
+	cmd        []string
+	entrypoint []string
+}
+
 const (
 	// Kubernetes CA certificate bundle is mounted into the pod here, see:
 	// https://kubernetes.io/docs/tasks/tls/managing-tls-in-a-cluster/#trusting-tls-in-a-cluster
@@ -89,24 +95,24 @@ func newResolverTransport(path string) (*http.Transport, error) {
 func (r *digestResolver) Resolve(
 	image string,
 	opt k8schain.Options,
-	registriesToSkip sets.String) (string, error) {
+	registriesToSkip sets.String) (*imageData, error) {
 	kc, err := k8schain.New(r.client, opt)
 	if err != nil {
-		return "", fmt.Errorf("failed to initialize authentication: %w", err)
+		return nil, fmt.Errorf("failed to initialize authentication: %w", err)
 	}
 
 	if _, err := name.NewDigest(image, name.WeakValidation); err == nil {
 		// Already a digest
-		return image, nil
+		return &imageData{digest: image}, nil
 	}
 
 	tag, err := name.NewTag(image, name.WeakValidation)
 	if err != nil {
-		return "", fmt.Errorf("failed to parse image name %q into a tag: %w", image, err)
+		return nil, fmt.Errorf("failed to parse image name %q into a tag: %w", image, err)
 	}
 
 	if registriesToSkip.Has(tag.Registry.RegistryStr()) {
-		return "", nil
+		return nil, nil
 	}
 	platform := v1.Platform{
 		Architecture: runtime.GOARCH,
@@ -114,7 +120,22 @@ func (r *digestResolver) Resolve(
 	}
 	desc, err := remote.Get(tag, remote.WithTransport(r.transport), remote.WithAuthFromKeychain(kc), remote.WithPlatform(platform))
 	if err != nil {
-		return "", fmt.Errorf("failed to fetch image information: %w", err)
+		return nil, fmt.Errorf("failed to fetch image information: %w", err)
+	}
+
+	img, err := desc.Image()
+	if err != nil {
+		return nil, fmt.Errorf("failed to image: %w", err)
+	}
+
+	configFile, err := img.ConfigFile()
+	if err != nil {
+		return nil, fmt.Errorf("failed to image configFile: %w", err)
+	}
+
+	imgData := imageData{
+		cmd:        configFile.Config.Cmd,
+		entrypoint: configFile.Config.Entrypoint,
 	}
 
 	// TODO(#3997): Use remote.Get to resolve manifest lists to digests as well
@@ -123,14 +144,15 @@ func (r *digestResolver) Resolve(
 	case types.OCIImageIndex, types.DockerManifestList:
 		img, err := desc.Image()
 		if err != nil {
-			return "", fmt.Errorf("failed to get image reference: %w", err)
+			return nil, fmt.Errorf("failed to get image reference: %w", err)
 		}
 		dgst, err := img.Digest()
 		if err != nil {
-			return "", fmt.Errorf("failed to get image digest: %w", err)
+			return nil, fmt.Errorf("failed to get image digest: %w", err)
 		}
-		return fmt.Sprintf("%s@%s", tag.Repository.String(), dgst), nil
+		imgData.digest = fmt.Sprintf("%s@%s", tag.Repository.String(), dgst)
 	default:
-		return fmt.Sprintf("%s@%s", tag.Repository.String(), desc.Digest), nil
+		imgData.digest = fmt.Sprintf("%s@%s", tag.Repository.String(), desc.Digest)
 	}
+	return &imgData, nil
 }

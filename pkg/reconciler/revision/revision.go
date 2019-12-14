@@ -46,7 +46,7 @@ import (
 )
 
 type resolver interface {
-	Resolve(string, k8schain.Options, sets.String) (string, error)
+	Resolve(string, k8schain.Options, sets.String) (*imageData, error)
 }
 
 // Reconciler implements controller.Reconciler for Revision resources.
@@ -143,8 +143,9 @@ func (c *Reconciler) reconcileDigest(ctx context.Context, rev *v1alpha1.Revision
 		ServiceAccountName: rev.Spec.ServiceAccountName,
 		ImagePullSecrets:   imagePullSecrets,
 	}
-	digest, err := c.resolver.Resolve(rev.Spec.GetContainer().Image,
+	imgData, err := c.resolver.Resolve(rev.Spec.GetContainer().Image,
 		opt, cfgs.Deployment.RegistriesSkippingTagResolving)
+	fmt.Printf("\nDUG: %#v\n", imgData)
 	if err != nil {
 		err = fmt.Errorf("failed to resolve image to digest: %w", err)
 		rev.Status.MarkContainerHealthyFalse(v1alpha1.ContainerMissing,
@@ -153,7 +154,7 @@ func (c *Reconciler) reconcileDigest(ctx context.Context, rev *v1alpha1.Revision
 		return err
 	}
 
-	rev.Status.ImageDigest = digest
+	rev.Status.ImageDigest = imgData.digest
 
 	return nil
 }
