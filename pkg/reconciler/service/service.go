@@ -19,6 +19,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"go.uber.org/zap"
@@ -58,6 +59,18 @@ var _ ksvcreconciler.Interface = (*Reconciler)(nil)
 // ReconcileKind implements Interface.ReconcileKind.
 func (c *Reconciler) ReconcileKind(ctx context.Context, service *v1.Service) pkgreconciler.Event {
 	logger := logging.FromContext(ctx)
+
+	// Exit if 'paused' label is there
+	// kubectl label ksvc/name paused="1" && \
+	//   kubectl delete config/name && kubectl delete route/name
+	for name, _ := range service.Labels {
+		if strings.HasPrefix(name, "cloud.ibm.com/pause-") {
+			service.Status.MarkConfigurationNotReconciled()
+			// serviceCondSet.Manage(service.Status).MarkUnknown(ServiceConditionConfigurationsReady,
+			// "Paused", "The Service is paused.")
+			return nil
+		}
+	}
 
 	config, err := c.config(ctx, service)
 	if err != nil {

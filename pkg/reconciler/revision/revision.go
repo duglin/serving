@@ -132,6 +132,30 @@ func (c *Reconciler) ReconcileKind(ctx context.Context, rev *v1.Revision) pkgrec
 	readyBeforeReconcile := rev.IsReady()
 	c.updateRevisionLoggingURL(ctx, rev)
 
+	// Exit if 'pause' label is there.
+	// We use a label instead of an annotation so we can quickly find it.
+	// The format of the label should be:
+	//    cloud.ibm.com/pause-REASON: DATA
+	// where REASON should be the high level reason for the pause (e.g. "build"
+	// to mean we're waiting for a build to complete). DATA is an instance
+	// specific piece of metadata about what we're waiting for (e.g.
+	// a buildrun name or UID).
+	// Watch for the need to wait for multiple instances of a resource.
+	// For example, watching for multiple service bindings. In this case
+	// the REASON will probably need service binding instance specific
+	// data to avoid a name conflict. Technically, the code here does not
+	// care what REASON and DATA are, it's really up to the code that will
+	// set/look for these labels, so that code can decide these details.
+	for name, _ := range rev.Labels {
+		if strings.HasPrefix(name, "cloud.ibm.com/pause-") {
+			// Technically, we should define "Paused" in:
+			//   pkg/apis/serving/v1/revision_lifecycle.go
+			// but to keep the patch small, let's just hard code it here
+			rev.Status.MarkResourcesAvailableUnknown("Paused", "")
+			return nil
+		}
+	}
+
 	reconciled, err := c.reconcileDigest(ctx, rev)
 	if err != nil {
 		return err
